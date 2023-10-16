@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+import sys
+import socket
+import select
+import json
+import argparse
+
+# First, grab our arguments from the command line
+#  bridge_id is our bridge ID ("1234" or whatever)
+#  lan_ports are the local UDP ports that we use to send/receive packets on our LAN(s)
+parser = argparse.ArgumentParser(description='CS 3700 bridge')
+parser.add_argument('bridge_id', type=str, help="Bridge ID (e.g., 02ab)")
+parser.add_argument('lan_ports', metavar='lan_port', type=int, nargs='+', help="UDP ports to connect to LANs")
+args = parser.parse_args()
+
+# This variable represents our bridge's ports.  It is a 0-indexed array, as per the project spec
+
+# Definition of a port
+class Port:
+  def __init__(self, id, lan_port):
+    self.id = id
+    self.lan_port = lan_port
+    self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self.socket.bind(('localhost', 0))
+    self.last_bpdu_sent = None
+    self.bpdus_heard = []
+    self.state = 1 # root = 0, designated = 1, blocked = 2, unassigned = -1
+
+  # This method sends a BPDU on this port.  Right now, it only sends a 
+  # BPDU that says this bridge believes its the root; obviously, this 
+  # will need to be updated.
+  def send_bpdu(self):
+    self.send(json.dumps({"source": args.bridge_id, 
+                          "dest": "ffff", 
+                          "msg_id": 0,
+                          "type": "bpdu", 
+                          "message": { "id": args.bridge_id, 
+                                      "root": args.bridge_id, 
+                                      "cost": 0, 
+                                      "port": self.id }
+                        }).encode('utf-8'))
+    self.last_bpdu_sent = BPDU(args.bridge_id, args.bridge_id, 0, self.id)
+
+  # This method sends the provided byte array "data" to the LAN, using the 
+  # UDP connection.
+  def send(self, data):
+    print("Sending message on port %d" % self.id)
+    self.socket.sendto(data, ('localhost', self.lan_port))
+  
+  # To determine whether a non-root port is designated,
+  # it needs to ask is the BPDU that I sent on this port
+  # better than any BPDU I have heard on this port?
+  def recalculate_status(self):
+    # get the last bpdu sent for this port
+    lastB = self.last_bpdu_sent
+    # set the last bpdu as the best
+    best = lastB
+
+    # compare all bpdus to best
+    for b in self.bpdus_heard:
+      # if b is better than best, best is set to b
+      if b < best:
+        best = b
+
+    # if the last bpdu sent has never been replaced,
+    # it is designated
+    if (best == lastB):
+      self.state = 1
+      print("Designated Port: " + str(self.id))
+    # if the last bpdu sent was replaced, 
+    # and it is not the root port, it is disabled
+    elif (self.state != 0):
+      self.state = 2
+      print("Disabled Port: " + str(self.id))
+
+class Bridge:
+  def __init__(self, id):
+    self.id = id
+    self.root = id # initially, it thinks its root is itself
+    self.PORTS = []
+    self.forwardTable = {} # key is the address, value is the port
+    self.seenMessages = {} # key is the source, value is a list of message ids
+
+
+  # This method is called whenever we add a bpdu to our list of ones we have heard
+  # it retags the bridges ports and changes the root based on our bpdus
+  def recalculate_everything(self):
+
+    # get best bpdu from list of all bpdus
+    lob = self.get_all_bpdus()
+    bestBPDU = lob[0]
+
+    # save original root 
+    oldRoot = self.root
+    
+    # tag all ports to default state (designated)
+    for p in self.PORTS:
+      p.state = 1
+
+    # if our id is better, then we must be the root
+    if (self.id < bestBPDU.root) or (self.id == bestBPDU.root):
+      # we are the root
+      self.root = self.id
+      print("Root Port: None")
+    else:
+      # we are not the root
+      self.root = bestBPDU.root
+      bestBPDU.source_port.state = 0
+      print("Root Port: " + str(bestBPDU.source_port.id))
+      
+    # root changed
+    if (oldRoot != self.root):
+      if (self.id == self.root):
+        # cost is zero if root is self
+        cost = 0
+      else:
+        # else, get cost from bestbpdu and add 1
+        cost = bestBPDU.cost + 1
+      print("New Root: " + self.root + " Cost: " + str(cost), flush=True)
+      # send new root out to ports
+      self.broadcast_bpdu(cost)
+      # reset the forwarding table because we have a new root
+      BRIDGE.forwardTable = {}
+
+    # re-tag the ports
+    seenLans = []
+    for p in self.PORTS:
+      # if we already have seen this lan at a lesser index,
+      # we disable all other ports with that lan
+      if p.lan_port not in seenLans:
+        p.recalculate_status()
+      else:
+        p.state = 2
+      seenLans.append(p.lan_port)
+
+
+
+  # returns a sorted list of all bpdus
+  def get_all_bpdus(self):
+    # init list
+    lob = []
+
+    for p in self.PORTS:
+      for b in p.bpdus_heard:
+        b.source_port = p
+        lob.append(b)
+
+    lob.sort()
+    
+    return lob
+  
+  # takes in cost and broadcasts updated bpdu and
+  # updates which bpdu was last sent from each port
+  def broadcast_bpdu(self, cost):
+    for p in self.PORTS:
+      p.send(json.dumps({"source": args.bridge_id, 
+                            "dest": "ffff", 
+                            "msg_id": 0,
+                            "type": "bpdu", 
+                            "message": {
+                                      "id": self.id, 
+                                      "root": self.root, 
+                                      "cost": cost, 
+                                      "port": p.id 
+                            }
+                          }).encode('utf-8'))
+      p.last_bpdu_sent = BPDU(self.id, self.root, cost, p.id)
+
+class BPDU:
+  def __init__(self, bridge_id, root, cost, port_id):
+    self.bridge_id = bridge_id
+    self.root = root #root id
+    self.cost = cost # cost to root
+    self.port_id = port_id
+    self.source_port = None # the port we recieved the bpdu from
+  
+  # serializes self into a json dictionary
+  def serialize(self):
+    return json.dumps(self)
+    
+  # unserializes json dictionary to make into a bpdu
+  def unserialize(message):
+    b = message["id"]
+    r = message["root"]
+    c = message["cost"]
+    p = message["port"]
+    return BPDU(b, r, c, p)
+  
+  # less than function
+  def __lt__(self, other):
+    if (self.root < other.root):
+      return True
+    elif (self.root == other.root) and (self.cost < other.cost):
+      return True
+    elif (self.root == other.root) and (self.cost == other.cost) and (self.bridge_id < other.bridge_id):
+      return True
+    elif (self.root == other.root) and (self.cost == other.cost) and (self.bridge_id == other.bridge_id) and (self.port_id < other.port_id):
+      return True
+    else:
+      return False
+    
+  def __eq__(self, other):
+    one = (self.root == other.root)
+    two = (self.bridge_id == other.bridge_id)
+    three = (self.cost == other.cost)
+    four = (self.port_id == other.port_id)
+    return one and two and three and four
+    
+  def __str__(self):
+    s = ""
+    s = s + "ID: " + str(self.bridge_id)
+    s = s + " ROOT: " + str(self.root)
+    s = s + " COST: " + str(self.cost)
+    s = s + " PORT: " + str(self.port_id)
+    return s
+
+
+
+# instantiate bridge
+BRIDGE = Bridge(args.bridge_id)
+
+# Set up our ports
+print("Bridge starting up")
+for i, lan_port in enumerate(args.lan_ports):
+  BRIDGE.PORTS.append(Port(i, lan_port))
+
+# This method sends a BPDU on all ports.  You might want to call this regularly...
+def send_bpdus():
+  for port in BRIDGE.PORTS:
+    port.send_bpdu()
+
+# Now we send a "hello" BPDU to all LANs to announce that we're here
+send_bpdus()
+
+# Main loop
+while True:
+  sockets = list(map(lambda p: p.socket, BRIDGE.PORTS))
+  readable, _, execeptable = select.select(sockets, [], sockets, 1)
+
+
+  for s in readable:
+    data, addr = s.recvfrom(1500)
+    message = data.decode('utf-8')
+    message_json = json.loads(message)
+
+    print("Received message: '%s'" % message)
+
+    # port we are receiving info on
+    recvFrom = BRIDGE.PORTS[sockets.index(s)]
+
+    # source of the message
+    recvSrce = message_json['source']
+    # destination of the message
+    recvDest = message_json['dest']
+    # msg_id
+    recvMsg = message_json['msg_id']
+
+
+
+    if message_json['type'] == 'bpdu':
+      b = BPDU.unserialize(message_json['message'])
+      recvFrom.bpdus_heard.append(b)
+      BRIDGE.recalculate_everything()
+
+    elif message_json['type'] == 'data':
+
+      if recvSrce not in BRIDGE.seenMessages.keys():
+        BRIDGE.seenMessages[recvSrce] = []
+
+      # If you receive a data message on a disabled port, ignore it.  Otherwise, continue.
+      if recvFrom.state != 2 and (recvMsg not in BRIDGE.seenMessages[recvSrce]):
+        BRIDGE.seenMessages[recvSrce].append(recvMsg)
+        print("Received " + str(recvSrce) + "/" + str(recvMsg) + " on port " + str(recvFrom.id) + " to " + str(recvDest), flush=True)
+
+        # Add an entry to the forwarding table for message[source] pointing to the port that you received the message from.
+        BRIDGE.forwardTable[recvSrce] = recvFrom
+
+        # Ask if message[dest] is in the forwarding table.
+        if (recvDest in BRIDGE.forwardTable.keys()):
+          # If it is, ask if message[dest] is the same port that you received the message on.  
+          if BRIDGE.forwardTable[recvDest].id != recvFrom.id:
+            # If so, ignore it. Otherwise, forward the data message out the port that message[dest] points to in the forwarding table.
+            portOut = BRIDGE.forwardTable[recvDest]
+            print("Forwarding " + str(recvSrce) + "/" + str(recvMsg))
+            portOut.send(json.dumps({"source": message_json['source'], 
+                                  "dest": message_json['dest'], 
+                                  "msg_id": message_json['msg_id'],
+                                  "type": message_json['type'], 
+                                  "message": message_json['message']
+                                }).encode('utf-8'))
+        else:
+          # If it is not, forward the message out every non-disabled port that is not the port it came in on.
+          for p in BRIDGE.PORTS:
+            if p != recvFrom and p.state != 2:
+              print("Broadcasting " + str(recvSrce) + "/" + str(recvMsg) + " to all active ports", flush=True)
+              p.send(json.dumps({"source": message_json['source'], 
+                                  "dest": message_json['dest'], 
+                                  "msg_id": message_json['msg_id'],
+                                  "type": message_json['type'], 
+                                  "message": message_json['message']
+                                }).encode('utf-8'))
+            else:
+              print("Not Forwarding " + str(recvSrce) + "/" + str(recvMsg))
+    
